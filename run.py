@@ -56,18 +56,64 @@ def run_benchmark(args) -> dict:
     return stats
 
 
+def run_research(args) -> None:
+    from research.study import CENTERS, END, PRIMARY_COST, START, backtest_inputs, metrics
+    from strategies import candidate_a, candidate_b, high_return
+
+    module, name = {
+        "high": (high_return, high_return.SELECTED_CANDIDATE),
+        "candid_a": (candidate_a, "A"),
+        "candid_b": (candidate_b, "B"),
+    }[args.strategy]
+    center = CENTERS[name]
+    start, end = args.start or START, args.end or END
+    lookback = args.lookback if args.lookback is not None else center.lookback
+    top_n = args.top_n if args.top_n is not None else center.top_n
+    frequency = args.frequency or center.frequency
+    if args.strategy == "high" and (start, end, lookback, top_n, frequency, args.cost) == (
+        START, END, center.lookback, center.top_n, center.frequency, PRIMARY_COST,
+    ):
+        from research.report import run_study
+
+        stats = run_study()
+        print("已生成 reports/high_return.md 与 results/high_return_*.csv")
+    else:
+        returns, weights = module.build_weights(
+            lookback=lookback, top_n=top_n, start=start, end=end, frequency=frequency,
+        )
+        returns, weights = backtest_inputs(returns, weights, start=start, end=end)
+        nav, _ = run_backtest(returns, weights, cost_rate=args.cost)
+        stats = metrics(nav, weights)
+    print(f"\n=== 候选 {name}（{lookback} 日 / 前 {top_n} / {frequency}）===")
+    print(format_stats(stats))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--strategy", choices=["ma", "momentum", "all", "bench"], default="momentum")
-    ap.add_argument("--start", default="2015-01-01")
+    ap.add_argument(
+        "--strategy", choices=["ma", "momentum", "all", "bench", "high", "candid_a", "candid_b"],
+        default="momentum",
+    )
+    ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
     ap.add_argument("--cost", type=float, default=0.0005, help="单边手续费率，默认万5")
     ap.add_argument("--fast", type=int, default=20)
     ap.add_argument("--slow", type=int, default=60)
-    ap.add_argument("--lookback", type=int, default=250, help="动量窗口，默认 250 日≈12 个月")
-    ap.add_argument("--top_n", type=int, default=3)
+    ap.add_argument("--lookback", type=int, help="动量窗口，现有动量默认 250 日")
+    ap.add_argument("--top_n", type=int)
+    ap.add_argument("--frequency", choices=["monthly", "biweekly"], help="候选策略调仓频率")
     args = ap.parse_args()
 
+    if args.strategy in ("high", "candid_a", "candid_b"):
+        run_research(args)
+        return
+
+    if args.start is None:
+        args.start = "2015-01-01"
+    if args.lookback is None:
+        args.lookback = 250
+    if args.top_n is None:
+        args.top_n = 3
     if args.strategy in ("bench", "all"):
         run_benchmark(args)
     if args.strategy in ("ma", "all"):
