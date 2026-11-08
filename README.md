@@ -68,6 +68,11 @@ strategies/ma_timing.py      策略二：双均线择时（对照组）
 run.py               命令行入口
 ```
 
+## 测试
+
+- 安装依赖 `python -m pip install -r requirements.txt`
+- 离线运行测试 `python -m pytest -q`
+
 ## 已知问题 / 下一步
 
 - [ ] 加交易日历对齐（目前用 ETF 自身交易日，长假前后可能错位）
