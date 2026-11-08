@@ -94,7 +94,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--strategy",
-        choices=["ma", "momentum", "all", "bench", "high", "candid_a", "candid_b", "lowvol_momentum"],
+        choices=["ma", "momentum", "all", "bench", "high", "candid_a", "candid_b", "lowvol_momentum", "micro_cap"],
         default="momentum",
     )
     ap.add_argument("--start", default=None)
@@ -105,8 +105,21 @@ def main() -> None:
     ap.add_argument("--lookback", type=int, help="动量窗口，现有动量默认 250 日")
     ap.add_argument("--top_n", type=int)
     ap.add_argument("--frequency", choices=["monthly", "biweekly"], help="候选策略调仓频率")
-    ap.add_argument("--cache", type=Path, help="低波动动量数据缓存")
+    ap.add_argument("--cache", type=Path, help="研究策略数据缓存")
     args = ap.parse_args()
+
+    if args.strategy == "micro_cap":
+        from qs.micro_cap_data import CACHE
+        from research.micro_cap_report import run_study
+
+        if any(value is not None for value in (args.start, args.end, args.lookback, args.top_n,
+                                                args.frequency)) or args.cost != 0.0005:
+            ap.error("micro_cap uses the registered IS/OOS protocol")
+        try:
+            print(run_study(args.cache or CACHE))
+        except FileNotFoundError as exc:
+            ap.exit(1, f"微盘数据缺口：{exc}\n请先运行 python -m research.micro_cap_fetch --resume。\n")
+        return
 
     if args.strategy == "lowvol_momentum":
         from qs.lowvol_momentum_data import CoverageError
