@@ -129,3 +129,81 @@ def test_placebos_match_turnover_and_respect_listing_dates():
         assert (trial.eq(0) | available).all().all()
         pd.testing.assert_series_equal(trial.gt(0).sum(axis=1), weights.gt(0).sum(axis=1))
         pd.testing.assert_series_equal(turnover(trial), turnover(weights))
+
+
+def test_capacity_audit_classifies_zero_unavailable_empty_and_2019_sample():
+    from research.high_return_capacity import audit, capacity_audit
+
+    dates = pd.bdate_range("2018-11-01", periods=70)
+    amount = pd.DataFrame(100e6, index=dates, columns=["ETF"])
+    amount.iloc[25:45] = 0.
+    amount.iloc[50] = np.nan
+    # The non-trading cash anchor must not become an extra empty capacity day.
+    returns = pd.DataFrame(0., index=dates.insert(0, dates[0] - pd.Timedelta(days=1)), columns=amount.columns)
+    targets = pd.DataFrame({"ETF": [1., .5, .25, 0.]}, index=dates[[20, 45, 55, 67]])
+    nav, gross, ledger = audit(returns, targets, amount)
+    yearly, recent = capacity_audit(ledger)
+    totals = yearly.iloc[:, 1:].sum().to_dict()
+    assert totals == dict(hold_zero=1, hold_unavailable=16, hold_empty=23,
+                          order_zero=1, order_unavailable=1)
+    assert ledger.capacity_diag.hold_adv.iloc[45] == 0
+    assert np.isnan(ledger.capacity_diag.hold_adv.iloc[51])
+    valid = (dates >= "2019-01-01") & ledger.count.gt(0) & ledger.capacity_diag.hold_kind.ne(
+        "unavailable").to_numpy()
+    assert recent.loc["holding", "days"] == valid.sum()
+    assert recent.loc["holding", "median"] == round(ledger.holding_capacity[valid].median() / 10_000, 1)
+    expected, _ = run_backtest(returns, targets)
+    pd.testing.assert_series_equal(nav, expected)
+    assert gross.eq(1.).all()
+
+
+def test_three_factor_attribution_matches_micro_cap_formula_and_loading_signs():
+    from types import SimpleNamespace
+
+    from qs.micro_cap_data import adjusted_prices
+    from research.capacity_report import three_factors
+    from research.high_return_capacity import attribution
+    from research.micro_cap_study import attribution as micro_attribution
+
+    dates = pd.bdate_range("2014-11-03", periods=100)
+    rng = np.random.default_rng(17)
+    returns = rng.normal(.0003, .02, (len(dates), 30))
+    market = SimpleNamespace(dates=dates, returns=returns, adjusted=adjusted_prices(returns),
+                             cap=np.broadcast_to(np.arange(1, 31), returns.shape).astype(float))
+    x = three_factors(market)
+    expected_beta = np.array([.8, -.4, .3])
+    gross = pd.Series(np.exp(x.to_numpy() @ expected_beta), index=x.index)
+    nav = (gross * np.exp(-.0001)).cumprod()
+    result = attribution(nav, gross, x, is_end="2020-12-31")
+    reference = micro_attribution(market, SimpleNamespace(nav=nav, gross=gross))
+    np.testing.assert_allclose(result.betas, expected_beta, atol=1e-12)
+    np.testing.assert_allclose(result.components, reference.components, atol=1e-12)
+    np.testing.assert_allclose(result.factor_sums, reference.factor_sums, atol=1e-12)
+    assert np.sign(result.betas).tolist() == [1, -1, 1]
+    assert result.components.sum() == pytest.approx(np.log(nav.iloc[-1]))
+
+
+def test_high_return_factor_loadings_are_frozen_at_is_boundary():
+    from research.high_return_capacity import attribution
+
+    dates = pd.bdate_range("2021-12-01", periods=60)
+    x = pd.DataFrame(np.random.default_rng(9).normal(0, .01, (60, 3)), index=dates)
+    log_gross = x.to_numpy() @ np.array([1., -.5, .25])
+    log_gross[dates > "2021-12-31"] = x.loc["2022-01-01":].to_numpy() @ np.array([-2., 3., -4.])
+    gross = pd.Series(np.exp(log_gross), index=dates)
+    result = attribution(gross.cumprod(), gross, x, is_end="2021-12-31")
+    np.testing.assert_allclose(result.betas, [1., -.5, .25], atol=1e-12)
+    np.testing.assert_allclose(result.factor_sums, x.sum().to_numpy())
+
+
+def test_capacity_replay_checks_nav_values_independently_of_csv_date_metadata(tmp_path):
+    from research.capacity_report import verify_nav
+
+    nav = pd.Series([1., 1.1], index=pd.bdate_range("2020-01-01", periods=2), name="nav")
+    path = tmp_path / "nav.csv"
+    nav.to_csv(path, index_label="date")
+    verify_nav(nav, path)
+    changed = nav.copy()
+    changed.iloc[-1] += .01
+    with pytest.raises(AssertionError):
+        verify_nav(changed, path)
