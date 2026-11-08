@@ -204,8 +204,8 @@ def render(study):
 def write_study(study, root=ROOT):
     reports = root / "reports"
     results = root / "results"
-    reports.mkdir(exist_ok=True)
-    results.mkdir(exist_ok=True)
+    reports.mkdir(parents=True, exist_ok=True)
+    results.mkdir(parents=True, exist_ok=True)
     (reports / "high_return.md").write_text(render(study), encoding="utf-8")
     nav = study["runs"][high_return.SELECTED_CANDIDATE][0]
     nav.to_csv(results / "high_return_nav.csv", index_label="date")
