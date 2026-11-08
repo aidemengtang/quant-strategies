@@ -4,9 +4,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from qs.micro_cap_data import Market, adjusted_prices, limit_masks
-from qs.micro_cap_execution import CAPITAL, fee_rates, fees, simulate
-from research.micro_cap_study import coarse, perturb
+from qs.micro_cap_data import Market, adjusted_prices, limit_masks, rolling_adv
+from qs.micro_cap_execution import CAPITAL, PARTICIPATION, fee_rates, fees, simulate
+from research.micro_cap_study import capacity_audit, coarse, perturb
 from strategies.micro_cap import Parameters, Selection, build_weights, rank, trailing
 
 
@@ -118,3 +118,64 @@ def test_weight_conservation_minimum_commission_and_future_perturbation():
     changed = simulate(perturb(market, when), {0: selected(0)}, 1)
     assert changed.nav.iloc[:3].equals(ledger.nav.iloc[:3])
     assert changed.nav.iloc[3] != ledger.nav.iloc[3]
+
+
+def test_capacity_audit_counts_empty_day_only_on_holding_side():
+    market = market_for(np.zeros((2, 1)))
+    market.adv[0, 0] = 0
+    ledger = simulate(market, {0: selected(0)}, 1, record=True)
+    assert ledger.capacity_diag.order_kind.iloc[1] == "zero"
+    yearly, _ = capacity_audit(ledger)
+    assert yearly.iloc[0].to_dict() == dict(year=2015, hold_zero=0, hold_unavailable=0,
+                                           hold_empty=2, order_zero=0, order_unavailable=0)
+
+
+def test_full_suspension_window_reports_real_zero_for_hold_and_order():
+    market = market_for(np.zeros((22, 1)))
+    market.amount[1:] = 0
+    market = replace(market, adv=rolling_adv(market.amount))
+    ledger = simulate(market, {19: selected(0), 20: selected()}, 1, record=True)
+    last = ledger.capacity_diag.iloc[-1]
+    assert last.hold_bottleneck_code == last.order_bottleneck_code == market.codes[0]
+    assert last.hold_adv == last.order_adv == 0
+    assert last.hold_kind == last.order_kind == "zero"
+    yearly, _ = capacity_audit(ledger)
+    assert yearly.loc[0, ["hold_zero", "order_zero"]].tolist() == [1, 1]
+
+
+def test_unavailable_adv_is_distinct_from_zero_capacity():
+    market = market_for(np.zeros((3, 1)))
+    market.adv[1, 0] = np.nan
+    ledger = simulate(market, {0: selected(0), 1: selected()}, 1, record=True)
+    assert ledger.holding_capacity.iloc[-1] == ledger.order_capacity.iloc[-1] == 0
+    yearly, _ = capacity_audit(ledger)
+    assert yearly.loc[0, ["hold_unavailable", "order_unavailable"]].tolist() == [1, 1]
+    assert yearly.loc[0, ["hold_zero", "order_zero"]].tolist() == [0, 0]
+
+
+def test_capacity_sensitivity_uses_only_2019_onward_without_changing_full_sample():
+    dates = pd.to_datetime(["2018-12-27", "2018-12-28", "2018-12-31",
+                            "2019-01-02", "2019-01-03", "2019-01-04"])
+    market = replace(market_for(np.zeros((len(dates), 1))), dates=dates)
+    market.adv[:, 0] = [100e6, 0, 20e6, 40e6, 80e6, 80e6]
+    market.sell[3:, 0] = False
+    ledger = simulate(market, {0: selected(0), 2: selected()}, 1, record=True)
+    yearly, recent = capacity_audit(ledger)
+    weight = ledger.capacity_diag.hold_weight.iloc[-1]
+    expected_median = round(PARTICIPATION * 40e6 / weight / 10_000, 1)
+    expected_p10 = round(PARTICIPATION * 24e6 / weight / 10_000, 1)
+    assert yearly.hold_zero.tolist() == [1, 0]
+    assert recent["days"].tolist() == [3, 3]
+    assert recent["median"].tolist() == [expected_median, expected_median]
+    assert recent["p10"].tolist() == [expected_p10, expected_p10]
+    assert ledger.holding_capacity.quantile(.1) == 0
+
+
+def test_capacity_audit_reports_dates_with_mismatched_ledger_values(capsys):
+    market = market_for(np.zeros((2, 1)))
+    ledger = simulate(market, {0: selected(0)}, 1, record=True)
+    ledger.holding_capacity.iloc[1] *= 1.01
+    date = str(market.dates[1].date())
+    with pytest.raises(ValueError, match=date):
+        capacity_audit(ledger)
+    assert date in capsys.readouterr().out

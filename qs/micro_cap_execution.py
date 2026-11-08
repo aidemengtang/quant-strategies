@@ -10,6 +10,8 @@ from qs.micro_cap_data import START, lot_rules
 CAPITAL = 5_000_000
 PARTICIPATION = .05
 TRADE_COLUMNS = ["date", "code", "side", "planned", "filled", "shares", "cost", "reason", "adjustment_cash"]
+CAPACITY_COLUMNS = ["date", "hold_bottleneck_code", "hold_adv", "hold_weight", "hold_kind",
+                    "order_bottleneck_code", "order_adv", "order_kind"]
 
 
 def fee_rates(dates):
@@ -20,6 +22,14 @@ def fee_rates(dates):
 
 def fees(notional, rate, other):
     return np.where(notional > 0, np.maximum(notional * rate, 5) + notional * other, 0.)
+
+
+def _bottleneck(codes, adv, code):
+    if code is None:
+        return None, np.nan, None
+    value = adv[code]
+    kind = "unavailable" if not np.isfinite(value) else "zero" if value == 0 else None
+    return codes[code], value, kind
 
 
 @dataclass
@@ -34,6 +44,7 @@ class Ledger:
     order_capacity: pd.Series
     trades: pd.DataFrame
     weights: pd.DataFrame
+    capacity_diag: pd.DataFrame
 
 
 def simulate(market, selections, n, *, rate=.0005, slip=.001, recovery=1., record=False, adv_floor=0.):
@@ -42,6 +53,7 @@ def simulate(market, selections, n, *, rate=.0005, slip=.001, recovery=1., recor
     lots = [lot_rules(code) for code in market.codes]
     cash, previous = float(CAPITAL), float(CAPITAL)
     held, pending, fills, weights, rows = {}, {}, [], [], []
+    capacity_diag = []
     expiry = -1
 
     def log(code, side, planned, filled, shares, cost, reason, adjustment_cash=0.):
@@ -61,6 +73,7 @@ def simulate(market, selections, n, *, rate=.0005, slip=.001, recovery=1., recor
                 log(code, "delist", value, value * recovery, 0, 0., "verified_mark" if recovery else "zero_recovery")
         equity = cash + sum(units * marks[code] for code, units in held.items())
         bottleneck = np.inf
+        order_code = None
         for code, target in list(pending.items()):
             delta = (target - held.get(code, 0.)) * marks[code]
             if abs(delta) < .01:
@@ -75,8 +88,10 @@ def simulate(market, selections, n, *, rate=.0005, slip=.001, recovery=1., recor
             if buying:
                 continue
             if equity > 0:
-                bottleneck = min(bottleneck, PARTICIPATION * adv[code] * equity / -delta
-                                 if np.isfinite(adv[code]) else 0.)
+                capacity = PARTICIPATION * adv[code] * equity / -delta if np.isfinite(adv[code]) else 0.
+                if record and capacity < bottleneck:
+                    order_code = code
+                bottleneck = min(bottleneck, capacity)
             if not market.sell[day, code]:
                 log(code, "sell", -delta, 0., 0, 0., "down_limit" if market.known[day, code] else "suspended_or_unknown")
                 continue
@@ -119,8 +134,10 @@ def simulate(market, selections, n, *, rate=.0005, slip=.001, recovery=1., recor
             if delta <= 0:
                 continue
             if equity > 0:
-                bottleneck = min(bottleneck, PARTICIPATION * adv[code] * equity / delta
-                                 if np.isfinite(adv[code]) else 0.)
+                capacity = PARTICIPATION * adv[code] * equity / delta if np.isfinite(adv[code]) else 0.
+                if record and capacity < bottleneck:
+                    order_code = code
+                bottleneck = min(bottleneck, capacity)
             if not market.buy[day, code]:
                 reason = ("risk" if market.risk[day, code] else "up_limit") if market.known[day, code] else "suspended_or_unknown"
             elif not np.isfinite(adv[code]) or adv[code] < adv_floor:
@@ -157,14 +174,19 @@ def simulate(market, selections, n, *, rate=.0005, slip=.001, recovery=1., recor
             pending.update({code: 0. for code in held if code not in pending})
             expiry = day + 3
         actual = {code: units * marks[code] / nav for code, units in held.items()} if nav > 0 else {}
+        hold_code = None
         if actual:
             lowest = sorted(actual, key=lambda code: adv[code] if np.isfinite(adv[code]) else -1)[:25]
-            capacity = min(PARTICIPATION * adv[code] / actual[code] if np.isfinite(adv[code]) else 0.
-                           for code in lowest)
+            hold_code, capacity = min(
+                ((code, PARTICIPATION * adv[code] / actual[code] if np.isfinite(adv[code]) else 0.)
+                 for code in lowest), key=lambda item: item[1])
         else:
             capacity = 0.
         if record:
             weights.extend((market.dates[day], market.codes[code], weight) for code, weight in actual.items())
+            hold_name, hold_adv, hold_kind = _bottleneck(market.codes, adv, hold_code)
+            capacity_diag.append((market.dates[day], hold_name, hold_adv, actual.get(hold_code, np.nan), hold_kind,
+                                  *_bottleneck(market.codes, adv, order_code)))
         rows.append((nav / CAPITAL, (nav + costs) / previous, turnover / equity if equity else 0.,
                      len(actual), max(actual.values(), default=0.), cash / nav if nav else 1.,
                      capacity, bottleneck if np.isfinite(bottleneck) else np.nan))
@@ -173,4 +195,5 @@ def simulate(market, selections, n, *, rate=.0005, slip=.001, recovery=1., recor
         "nav", "gross", "turnover", "count", "max_weight", "cash", "holding_capacity", "order_capacity"))
     return Ledger(*(frame[c] for c in frame),
                   pd.DataFrame(fills, columns=TRADE_COLUMNS),
-                  pd.DataFrame(weights, columns=["date", "code", "weight"]))
+                  pd.DataFrame(weights, columns=["date", "code", "weight"]),
+                  pd.DataFrame(capacity_diag, columns=CAPACITY_COLUMNS))

@@ -1,12 +1,24 @@
 """Write the registered microcap research report and reproducible result tables."""
 
+from filecmp import cmp
+from pathlib import Path
+from shutil import copyfile
+import sys
+from tempfile import TemporaryDirectory
+
 import numpy as np
 import pandas as pd
 
-from qs.micro_cap_data import CACHE, END, IS_END, ROOT, build_market
-from research.micro_cap_study import (EPISODES, NS, OOS, PERIODS, WINDOWS, calibrate, factors,
-                                      growth_stats, metrics, params_from, screen, validate)
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from qs.micro_cap_data import CACHE, IS_END, ROOT, build_market
+from research.micro_cap_study import (CAPACITY_SENSITIVITY_START, EPISODES, NS, OOS, PERIODS, WINDOWS,
+                                      capacity_audit, factors, growth_stats, metrics, params_from, validate)
 from strategies.micro_cap import universe
+
+CAPACITY_FILE = "micro_cap_capacity_diag.csv"
+PROTECTED_RESULTS = ("nav", "trades", "weights", "monthly")
 
 
 def table(headers, rows):
@@ -36,6 +48,52 @@ def days_underwater(nav):
     return f"{ages.max()} 个交易日，期末水下 {ages.iloc[-1]} 个交易日"
 
 
+def capacity_disclosure(market, ledger):
+    yearly, recent = capacity_audit(ledger)
+    early = yearly.loc[yearly.year < pd.Timestamp(CAPACITY_SENSITIVITY_START).year]
+    hold_zero, order_zero = early[["hold_zero", "order_zero"]].sum()
+    invested = ledger.count.gt(0)
+    before_cutoff = ledger.count.index < CAPACITY_SENSITIVITY_START
+    hold_days = (before_cutoff & invested).sum()
+    order_days = (before_cutoff & invested & ledger.order_capacity.notna()).sum()
+    early_weights = ledger.weights.loc[ledger.weights.date.lt(CAPACITY_SENSITIVITY_START)]
+    dates = market.dates.get_indexer(early_weights.date)
+    codes = market.codes.get_indexer(early_weights.code)
+    observed = (dates > 0) & (codes >= 0)
+    zero_adv = market.adv[dates[observed] - 1, codes[observed]] == 0
+    suspended = early_weights.loc[observed].loc[zero_adv]
+    example = ""
+    if not suspended.empty:
+        code = suspended.code.value_counts().index[0]
+        days = suspended.loc[suspended.code.eq(code), "date"]
+        example = (f"例如，`{code}` 在 {days.min():%Y 年 %-m 月}至 {days.max():%Y 年 %-m 月}间"
+                   f"有 {len(days)} 个交易日触发零瓶颈。旧手工示例按停牌标记计数，包含标记为停牌但"
+                   "窗口内仍有成交额的日期。逐股示例按成交额更正，年度合计一致。")
+
+    counts = yearly[["year", "hold_zero", "hold_empty", "order_zero"]]
+    totals = ("合计", *counts.iloc[:, 1:].sum())
+    samples = []
+    for label, kind, full in (("实际持仓", "holding", ledger.holding_capacity),
+                              ("计划订单", "order", ledger.order_capacity.dropna())):
+        days, median, p10 = recent.loc[kind, ["days", "median", "p10"]]
+        samples.append((label, f"{len(full):,}", amount(full.median()), amount(full.quantile(.1)),
+                        int(days), amount(median * 10_000), amount(p10 * 10_000)))
+
+    early_start, early_end = early.year.min(), early.year.max()
+    return f"""### 零容量日拆分与 2019 年起的敏感性
+
+按当日实际持仓和未过期的计划订单检查前一交易日可得的 20 日 ADV。真实零指瓶颈标的的完整窗口成交额为零。ADV 不可得指窗口内可核验的成交额不足 20 日。空仓单列，只计入持仓侧的空仓日，无计划订单日不计入订单统计。
+
+{table(["年份", "持仓真实零", "空仓记零", "订单真实零"], [*counts.itertuples(index=False, name=None), totals])}
+
+注：加载器把已确认停牌且无报价的成交额记为零。本账本持仓及订单瓶颈的 ADV 不可得分别为 {yearly.hold_unavailable.sum()} 天和 {yearly.order_unavailable.sum()} 天。换手率为零或缺失影响流通市值反推，ADV 直接用成交额计算。逐日瓶颈标的及 ADV 见 [容量诊断](../results/{CAPACITY_FILE})。
+
+{table(["容量口径", "原账本日数", "原账本中位数", "原账本 P10", f"{CAPACITY_SENSITIVITY_START} 起有效日数", "2019 年起中位数", "2019 年起 P10"], samples)}
+
+{early_start}–{early_end} 的数据可用，保留在原口径中。这段的 P10 被真实零压至零，真实零占有持仓日的 {hold_zero}/{hold_days}（{hold_zero / hold_days:.1%}）和有计划订单日的 {order_zero}/{order_days}（{order_zero / order_days:.1%}）。{example}2019 年起的列使用现有 IS 账本的有效样本，保留可核验的真实零，原全段验收结论仍适用。
+"""
+
+
 def result_rows(data, selection, ledger, out):
     out.mkdir(parents=True, exist_ok=True)
     primary = ledger["primary"]
@@ -60,6 +118,7 @@ def result_rows(data, selection, ledger, out):
     primary.count.groupby(primary.count.index.to_period("M")).agg(
         month_end="last", minimum="min", maximum="max", average="mean").to_csv(out / "micro_cap_monthly.csv")
     pd.Series(ledger["placebo"], name="cagr").to_csv(out / "micro_cap_placebo.csv", index_label="run")
+    primary.capacity_diag.to_csv(out / CAPACITY_FILE, index=False)
 
 
 def report(market, params, grid, exact, frozen, outcome, out, destination):
@@ -72,7 +131,8 @@ def report(market, params, grid, exact, frozen, outcome, out, destination):
     isin = annual(daily.loc[:IS_END])
     section = []
     labels = ["市场 beta", "市值因子", "其他风格（20 日动量）", "选股残差", "交易摩擦"]
-    components = outcome["attribution"]
+    attribution = outcome["attribution"]
+    components = attribution.components
     net = components.sum()
     share = components[1] / net if abs(net) > 1e-12 else np.nan
     title = "# A 股微盘反转"
@@ -128,11 +188,15 @@ def report(market, params, grid, exact, frozen, outcome, out, destination):
     verdict = "达到 §1 数字门槛" if all(row[3] for row in failed) else "未达标"
     note = ("参数已冻结。主账本只产生一条 OOS 路径，成本、对照及扰动均使用相同参数。"
             if frozen else "20 个精算候选均未通过预登记的 IS 冻结门槛。按提案停止选参，未评估 OOS。以下展示 IS 精算年化最高候选。")
+    takeaway = ""
+    if not frozen and share > .7 and robust and components[3] < 0:
+        takeaway = ("本轮 IS 诊断更接近「size beta 加选股止损」，即同桶选股改善了相对表现，"
+                    "但绝对收益主要由市场和市值暴露支撑，尚无因子调整后正收益或回撤保护的证据。\n\n")
     section.append(f"""## 1. 结论
 
 **{verdict}。** {note} {scope}净年化 **{pct(stats["cagr"])}**，最大回撤 **{pct(stats["dd"])}**。
 
-{table(["指标", scope, "门槛", "判定"], formatted)}
+{takeaway}{table(["指标", scope, "门槛", "判定"], formatted)}
 """)
     section.append(f"""## 2. 策略逻辑
 
@@ -212,11 +276,22 @@ V1 {"通过" if is_pass else "未通过" if frozen else "未评估"}。{"该策�
 {table(["样本", "策略净年化", "随机 P95", "单尾 p", "判定"], [
     (f"{scope}，{len(placebo)} 次", pct(stats["cagr"]), pct(threshold), f"{p_value:.4f}", "通过" if robust else "未通过")])}
 """)
+    rank = (placebo >= stats["cagr"]).sum() + 1
+    lower = (placebo < stats["cagr"]).sum()
+    beta_market, beta_size, beta_momentum = attribution.betas
+    raw_market, raw_size, raw_momentum = attribution.factor_sums
+    rounded_sum = np.round(components[:2], 4).sum()
     section.append(f"""## 10. 收益归因（V8）
 
 以 IS 估计市场（股票等权）、市值（流通市值最低减最高五分位）与其他风格（20 日动量最高减最低五分位）暴露，按日拟合毛对数收益。残差含无法识别的其他因子；摩擦为同一成交路径的净毛差额。占比以累计净对数收益为分母。
 
 {table(["分量", "累计对数贡献", "占净收益"], [(label, pct(x), pct(x / net) if net else "—") for label, x in zip(labels, components)])}
+
+同桶随机对照以每次调仓在相同市值桶内抽取相同数量、沿用相同目标权重和成交规则的 {len(placebo)} 条路径为基准，比较扣费年化。{lower} 条路径低于策略的样本内年化，单尾 p 值为 {rank}/{len(placebo) + 1}，约为 {p_value:.3f}。这回答了在预定的市值桶分配下，反转排序能否跑赢随机抽样。结果仍受 IS 选参影响，实际成交、现金和桶内个股暴露也会随抽样变化。
+
+选股残差 {pct(components[3])} 的基准是市场等权、市值价差和 20 日动量价差对策略毛对数收益的无截距日频拟合。该数字是毛对数收益扣除拟合因子贡献后的累计差额，也包含模型未捕捉的暴露与漂移。同桶随机路径可以落后于策略，同时策略的毛收益仍低于三因子拟合值。
+
+市值因子是按前一交易日流通市值分组的最小五分位等权日收益减最大五分位等权日收益。市场与市值载荷分别为 **{beta_market:.3f}** 和 **{beta_size:.3f}**。两因子的原始日收益累计和分别为 {pct(raw_market)} 和 {pct(raw_size)}，乘各自载荷后得到 {pct(components[0])} 和 {pct(components[1])} 的累计对数贡献。用未舍入值合计为 {pct(components[0] + components[1])}，手工稿的 {pct(rounded_sum)} 来自先舍入分项再相加。动量载荷为 **{beta_momentum:.3f}**，其原始日收益累计和为 {pct(raw_momentum)}。累计贡献取决于因子本身的收益尺度和载荷，负残差及交易摩擦抵消了其中一部分。
 """)
     order_caps = primary.order_capacity.dropna()
     zero_order = order_caps.eq(0).mean()
@@ -237,6 +312,7 @@ V1 {"通过" if is_pass else "未通过" if frozen else "未评估"}。{"该策�
 
 持仓不足 25 只时取全部实际持仓，空仓日记 0。订单口径取有计划订单的交易日，含顺延卖单，按当时已知 20 日 ADV。两者都取逐日最小值后计算分位数。500 万元模拟本金低于两种 P10：{"是" if min(stats["hold_p10"], stats["order_p10"]) >= 5_000_000 else "否"}。订单瓶颈为零的交易日占 {pct(zero_order)}，持仓瓶颈为零占 {pct(zero_hold)}。按此结果{"有 500 万元容量证据" if min(stats["hold_p10"], stats["order_p10"]) >= 5_000_000 else "个人 500 万元规模也未验证"}。
 
+{capacity_disclosure(market, primary)}
 {table(["IS 实际精算的 ADV 档", "订单 P10", "持仓 P10"], [
     (amount(f), amount(o), amount(h)) for f, o, h in exact_capacity.itertuples(index=False, name=None)])}
 
@@ -291,26 +367,31 @@ V9（{scope}）删除最后一年，共同区间截至 {cutoff}，日净值逐�
 
 
 def run_study(cache=CACHE, *, out=ROOT / "results", destination=ROOT / "reports/micro_cap.md"):
+    """Replay the existing IS report without running the parameter grid or OOS."""
+    grid = pd.read_csv(out / "micro_cap_is_grid.csv", float_precision="round_trip")
+    exact = pd.read_csv(out / "micro_cap_is_exact.csv", float_precision="round_trip")
+    if exact.empty or exact.qualified.any():
+        raise ValueError("This report requires the archived calibration with no qualified IS candidate")
+    params = params_from(exact.loc[exact.cagr.idxmax()])
     market = build_market(cache=cache)
     sample = market.through(IS_END)
-    sample_order = universe(sample)
-    grid = screen(sample, sample_order)
-    exact, locked = calibrate(sample, sample_order, grid)
-    frozen = locked is not None
-    diagnostic = params_from(exact.sort_values("cagr", ascending=False, kind="stable").iloc[0])
-    params = locked if frozen else diagnostic
-    evaluated = market if frozen else sample
-    order = universe(market) if frozen else sample_order
-    print(f"{'已冻结' if frozen else 'IS 失败，仅做 IS 诊断'}：{params}", flush=True)
-    out.mkdir(parents=True, exist_ok=True)
-    grid.to_csv(out / "micro_cap_is_grid.csv", index=False)
-    exact.to_csv(out / "micro_cap_is_exact.csv", index=False)
+    print(f"复放已归档 IS 诊断：{params}", flush=True)
     survivors = np.ones(len(market.codes), dtype=bool)
     for codes in market.exits.values():
         survivors[codes] = False
-    outcome = validate(evaluated, params, order, survivors)
-    result_rows(evaluated, params, outcome, out)
-    report(market, params, grid, exact, frozen, outcome, out, destination)
+    outcome = validate(sample, params, universe(sample), survivors)
+    with TemporaryDirectory() as temporary:
+        staging = Path(temporary)
+        result_rows(sample, params, outcome, staging)
+        changed = []
+        for suffix in PROTECTED_RESULTS:
+            name = f"micro_cap_{suffix}.csv"
+            if not cmp(staging / name, out / name, shallow=False):
+                changed.append(name)
+        if changed:
+            raise ValueError(f"Replay differs from archived CSVs: {', '.join(changed)}")
+        copyfile(staging / CAPACITY_FILE, out / CAPACITY_FILE)
+    report(market, params, grid, exact, False, outcome, out, destination)
     return metrics(outcome["primary"])
 
 

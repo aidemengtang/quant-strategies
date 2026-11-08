@@ -1,13 +1,13 @@
 """Two-stage IS research and once-frozen microcap validation."""
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from itertools import product
 
 import numpy as np
 import pandas as pd
 
 from qs.micro_cap_data import END, IS_END, START
-from qs.micro_cap_execution import CAPITAL, fee_rates, fees, simulate
+from qs.micro_cap_execution import CAPITAL, PARTICIPATION, fee_rates, fees, simulate
 from strategies.micro_cap import Parameters, Selection, eligible, plan, rank, schedule, trailing, universe
 
 WINDOWS = (5, 10, 15, 20, 25)
@@ -15,6 +15,7 @@ NS = (15, 20, 25, 30, 35)
 FLOORS = tuple(range(30_000_000, 60_000_001, 5_000_000))
 WIDTHS = (20, 50, 100)
 OOS = "2021-01-01"
+CAPACITY_SENSITIVITY_START = "2019-01-01"
 FEE_GRID = tuple(product((.0005, .001, .002), (.001, .002)))
 EPISODES = (
     ("股灾与熔断", "2015-06-01", "2016-01-31"),
@@ -121,6 +122,42 @@ def metrics(ledger):
     }
 
 
+def capacity_audit(ledger):
+    """Classify daily bottlenecks and summarize the effective 2019+ sample."""
+    diag = ledger.capacity_diag.set_index("date")
+    if not diag.index.equals(ledger.holding_capacity.index):
+        raise ValueError("Capacity diagnostics must cover every ledger date")
+    empty = ledger.count.eq(0)
+    hold_unavailable = diag.hold_kind.eq("unavailable") & ~empty
+    order_unavailable = diag.order_kind.eq("unavailable") & ~empty
+    recomputed = (PARTICIPATION * diag.hold_adv / diag.hold_weight).mask(empty | hold_unavailable, 0.)
+    disagrees = ~np.isclose(recomputed, ledger.holding_capacity, rtol=1e-6, atol=0)
+    if disagrees.any():
+        dates = ", ".join(diag.index[disagrees].strftime("%Y-%m-%d"))
+        message = f"Holding capacity disagrees on: {dates}"
+        print(message)
+        raise ValueError(message)
+
+    daily = pd.DataFrame({
+        "hold_zero": diag.hold_kind.eq("zero") & ~empty,
+        "hold_unavailable": hold_unavailable,
+        "hold_empty": empty,
+        "order_zero": diag.order_kind.eq("zero") & ~empty,
+        "order_unavailable": order_unavailable,
+    })
+    yearly = daily.groupby(diag.index.year).sum().reset_index(names="year")
+    recent = diag.index >= CAPACITY_SENSITIVITY_START
+    groups = {
+        "holding": ledger.holding_capacity[recent & ~empty & ~hold_unavailable],
+        "order": ledger.order_capacity[recent & ~empty & ~order_unavailable].dropna(),
+    }
+    summary = pd.DataFrame.from_dict({
+        name: {"days": len(values), "median": values.median() / 10_000, "p10": values.quantile(.1) / 10_000}
+        for name, values in groups.items()
+    }, orient="index").round({"median": 1, "p10": 1})
+    return yearly, summary
+
+
 def neighborhood(grid, params):
     fixed = grid.loc[(grid.skip == params.skip) & (grid.cadence == params.cadence)
                      & (grid.floor == params.floor) & (grid.width == params.width)]
@@ -192,6 +229,13 @@ def _cross_mean(values, mask):
                      out=np.zeros(len(values)), where=counts > 0)
 
 
+@dataclass(frozen=True)
+class Attribution:
+    components: np.ndarray
+    betas: np.ndarray
+    factor_sums: np.ndarray
+
+
 def attribution(market, ledger):
     """Fit exposures in IS, apply frozen exposures to subsequent daily log returns."""
     start = market.dates.searchsorted(START)
@@ -213,7 +257,8 @@ def attribution(market, ledger):
     is_mask = ledger.nav.index <= IS_END
     betas = np.linalg.lstsq(x[is_mask], gross[is_mask], rcond=None)[0]
     components = (x * betas).sum(axis=0)
-    return np.r_[components, gross.sum() - components.sum(), (net - gross).sum()]
+    return Attribution(np.r_[components, gross.sum() - components.sum(), (net - gross).sum()],
+                       betas, x.sum(axis=0))
 
 
 def perturb(market, start):
