@@ -1,4 +1,5 @@
-akshare>=1.16
+akshare==1.19.1
+baostock==0.9.4
 pandas>=2.0
 numpy>=1.24
 pyarrow>=14.0

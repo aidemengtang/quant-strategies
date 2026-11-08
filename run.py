@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
 
 from qs.data import ETF_POOL
 from qs.engine import format_stats, perf_stats, run_backtest
@@ -91,7 +93,8 @@ def run_research(args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--strategy", choices=["ma", "momentum", "all", "bench", "high", "candid_a", "candid_b"],
+        "--strategy",
+        choices=["ma", "momentum", "all", "bench", "high", "candid_a", "candid_b", "lowvol_momentum"],
         default="momentum",
     )
     ap.add_argument("--start", default=None)
@@ -102,7 +105,25 @@ def main() -> None:
     ap.add_argument("--lookback", type=int, help="动量窗口，现有动量默认 250 日")
     ap.add_argument("--top_n", type=int)
     ap.add_argument("--frequency", choices=["monthly", "biweekly"], help="候选策略调仓频率")
+    ap.add_argument("--cache", type=Path, help="低波动动量数据缓存")
     args = ap.parse_args()
+
+    if args.strategy == "lowvol_momentum":
+        from qs.lowvol_momentum_data import CoverageError
+        from research.lowvol_momentum_report import run_study
+        from research.lowvol_momentum_scan import DEFAULT_CACHE
+
+        if any(value is not None for value in (args.start, args.end, args.lookback, args.top_n,
+                                                args.frequency)) or args.cost != 0.0005:
+            ap.error("lowvol_momentum uses a fixed research protocol")
+        os.environ.update(no_proxy="*", NO_PROXY="*")
+        try:
+            print(format_stats(run_study(args.cache or DEFAULT_CACHE)))
+        except (CoverageError, FileNotFoundError) as exc:
+            ap.exit(1, f"低波动动量数据未通过勘测：{exc}\n"
+                    "请先运行 python -m research.lowvol_momentum_scan 和 "
+                    "python -m research.lowvol_momentum_fetch --resume。\n")
+        return
 
     if args.strategy in ("high", "candid_a", "candid_b"):
         run_research(args)
