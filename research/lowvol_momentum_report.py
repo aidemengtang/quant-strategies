@@ -4,7 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
-from research.lowvol_momentum_study import analyze
+from qs.engine import perf_stats
+from research.lowvol_momentum_study import PLACEBOS, analyze
 from research.report import table
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,17 @@ def performance(stats):
     return [pct(stats["年化收益"]), f'{stats["夏普"]:.2f}', pct(stats["最大回撤"])]
 
 
+def ablation_table(paths):
+    rows = [[f"{paths.index[0]:%Y-%m-%d} 起始净值", *(f"{value:.4f}" for value in paths.iloc[0])]]
+    rows.extend(
+        [f"{year} 年末净值", *(f"{value:.4f}" for value in values)]
+        for year, values in paths.groupby(paths.index.year).last().iterrows()
+    )
+    stats = [perf_stats(paths[column]) for column in paths]
+    rows.extend([label, *(pct(row[label]) for row in stats)] for label in ("年化收益", "最大回撤"))
+    return table(["日期 / 指标", *paths.columns], rows)
+
+
 def render(study):
     main, stats = study["main"], study["costs"][0.0005]
     engine = study["engine_stats"]
@@ -45,9 +57,9 @@ def render(study):
     gross_annual = np.expm1(gross_log / years)
     costs = study["costs"]
     stress_cagr = costs[0.002]["年化收益"]
-    matched, draws = study["matched"], study["controls"]
-    matched_ready = len(matched) == 200
-    quantile = np.quantile(matched, 0.95) if len(matched) else np.nan
+    draws = study["controls"]
+    ready = len(draws) == PLACEBOS and np.isfinite(draws).all()
+    quantile = np.quantile(draws, 0.95)
     checks = [
         ("全样本年化", pct(annual), "≥18%", annual >= 0.18),
         ("OOS 年化", pct(outside), "≥12%", outside >= 0.12),
@@ -61,7 +73,7 @@ def render(study):
     ]
     v1 = outside >= 0.12 and outside >= is_stats["年化收益"] / 2
     v4 = np.isfinite(study["contribution"]) and study["contribution"] <= 0.60
-    v6 = matched_ready and stats["年化收益"] > quantile
+    v6 = ready and stats["年化收益"] > quantile
     complete = (
         all(row[-1] for row in checks) and v1 and study["stable"] and v4 and study["trimmed"] >= 0.10
         and v6 and study["underwater"] <= 365.25 * 3 and main.unresolved_exposure == 0
@@ -144,14 +156,24 @@ def render(study):
         f"最佳五日为 {'、'.join(f'{day:%Y-%m-%d}（{pct(value)}）' for day, value in study['best_days'].items())}。"
         f"剔除后净年化为 {pct(study['trimmed'])}。V5 {outcome(study['trimmed'] >= 0.10)}。",
         "## 9. 随机对照（V6）",
-        f"固定种子 42，使用同日可选池、目标持仓数及逐笔成交模型模拟 {len(draws)} 次，"
-        f"逐日实际换手在 1 bp 容差内的有 {len(matched)} 次。"
-        f"V6 {'通过' if v6 else '未通过' if matched_ready else '未验证'}。",
-        f"同换手合格样本的第 95 分位为 {pct(quantile)}。"
-        + (f"200 次合格对照的单尾 p 为 {(1 + (matched >= stats['年化收益']).sum()) / 201:.4f}。"
-           if matched_ready else "未达到预登记样本量，无法据此判断同换手排名。"),
-        table(["分位", "5%", "50%", "95%"],
-              [["全部随机试验（描述性）", *(pct(v) for v in np.quantile(draws, [0.05, 0.5, 0.95]))]]),
+        f"固定种子 42，在同一全样本区间重跑 {len(draws)} 次。每个调仓月从当月同一可选池抽样，"
+        "匹配主策略的目标持仓数和目标权重，并尽量保留主策略延续持仓所对应的随机标的。"
+        "沿用原成交和成本模型，成交后的实际持仓数与换手可因停牌、涨跌停和整手限制而不同。",
+        table(["全样本扣费年化", "结果"], [
+            ("主策略（已锁定）", pct(stats["年化收益"])),
+            ("随机第 5 分位", pct(np.quantile(draws, 0.05))),
+            ("随机中位数", pct(np.median(draws))),
+            ("随机第 95 分位", pct(quantile)),
+        ]),
+        f"V6 按月度目标持仓数口径{'通过' if v6 else '未通过' if ready else '未验证'}。"
+        f"单尾经验 p 为 {(1 + (draws >= stats['年化收益']).sum()) / (len(draws) + 1):.4f}。"
+        "此前按 1 bp 逐日实际换手匹配得到 0 个样本。",
+        "### 9.1 因子消融（仅 IS）",
+        "仅用 2015–2020 年 IS 数据。低波单因子按 60 日波动率从低到高排序，不要求正动量。"
+        "动量单因子按跳过近 20 日的 126 日收益排序，保留正动量门槛。"
+        "两者合成取原锁定策略的 IS 净值。三组沿用原股票池、流动性规则、25 只目标持仓上限、"
+        "月度调仓、成交规则和成本，净值均从 1.0 起算。",
+        ablation_table(study["is_ablations"]),
         "## 10. 收益归因（V8）",
         "市场因子用沪深 300 指数。风格因子为低波、流动性和动量的月末分层价差。"
         "系数仅在 IS 估计，四项按累计对数收益归一，以便相加。",

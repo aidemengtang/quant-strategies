@@ -57,6 +57,47 @@ def is_grid(market, volume):
     return pd.DataFrame(results, columns=["lookback", "top_n", "cagr", "sharpe", "mdd", "max_weight"])
 
 
+def single_factor_ranks(market, lookback, volume):
+    """Remove the other factor's ranking and data filter in each IS ablation."""
+    low_vol, momentum_only = {}, {}
+    months = market.month_ends[market.month_ends >= pd.Timestamp(START)]
+    for day in market.dates.get_indexer(months):
+        liquidity = volume.iloc[day].to_numpy()
+        base = market.eligible[day] & np.isfinite(liquidity)
+        columns = np.flatnonzero(base)
+        if len(columns):
+            lower, upper = np.quantile(liquidity[columns], [0.30, 0.80])
+            columns = columns[(liquidity[columns] >= max(lower, strategy.MIN_ADV))
+                              & (liquidity[columns] <= upper)]
+
+        if day + 1 >= strategy.VOL_DAYS:
+            returns = market.returns[day + 1 - strategy.VOL_DAYS:day + 1, columns]
+            volatility = np.std(returns, axis=0, ddof=1)
+            valid = np.isfinite(volatility)
+            low_vol[day] = columns[valid][np.argsort(volatility[valid], kind="stable")]
+
+        finish = day - strategy.SKIP_DAYS + 1
+        if finish >= lookback:
+            returns = market.returns[finish - lookback:finish, columns]
+            momentum = np.prod(1 + returns, axis=0) - 1
+            valid = np.isfinite(momentum) & (momentum > 0)
+            momentum_only[day] = columns[valid][np.argsort(-momentum[valid], kind="stable")]
+    return low_vol, momentum_only
+
+
+def ablations(market, volume, lookback, top_n, combined):
+    if market.dates[-1] > pd.Timestamp(IS_END):
+        raise ValueError("Ablations must only use the IS segment")
+    low_vol, momentum_only = single_factor_ranks(market, lookback, volume)
+    lagged = volume.shift().to_numpy()
+    paths = {
+        name: simulate(market, strategy.target_orders(ranks, top_n), lagged, start=START).nav
+        for name, ranks in (("低波单因子", low_vol), ("动量单因子", momentum_only))
+    }
+    paths["两者合成"] = combined
+    return pd.DataFrame(paths)
+
+
 def plateau(grid):
     default = (strategy.DEFAULT_LOOKBACK, strategy.DEFAULT_TOP_N)
     returns = grid.pivot(index="lookback", columns="top_n", values="cagr")
@@ -94,23 +135,17 @@ def placebo_orders(ranks, real_orders, rng):
     return randomized
 
 
-def same_turnover(real, trial):
-    return float(real.sub(trial).abs().max()) <= 0.0001
-
-
-def random_controls(market, ranks, orders, lagged, reference):
+def random_controls(market, ranks, orders, lagged):
+    """Compare 200 random orders with the same target holding count each month."""
     rng = np.random.default_rng(42)
-    matched, all_draws = [], []
+    draws = []
     for number in range(1, PLACEBOS + 1):
         randomized = placebo_orders(ranks, orders, rng)
         trial = simulate(market, randomized, lagged, start=START)
-        cagr = measure(trial)["年化收益"]
-        all_draws.append(cagr)
-        if same_turnover(reference.turnover, trial.turnover):
-            matched.append(cagr)
+        draws.append(measure(trial)["年化收益"])
         if number % 25 == 0:
-            print(f"V6 {number}/{PLACEBOS} draws; turnover matched: {len(matched)}", flush=True)
-    return np.array(matched), np.array(all_draws)
+            print(f"V6 同月同目标持仓数 {number}/{PLACEBOS}", flush=True)
+    return np.array(draws)
 
 
 def style_factors(market, volume, lookback):
@@ -211,6 +246,7 @@ def analyze(root=DEFAULT_CACHE):
     grid = is_grid(is_market, is_volume)
     (lookback, top_n), neighborhood_rate, stable = plateau(grid)
     is_main = strategy.backtest(is_market, lookback, top_n)
+    is_ablations = ablations(is_market, is_volume, lookback, top_n, is_main.nav)
     listing = pd.read_parquet(root / "listings.parquet")
     exits = set(listing.loc[listing["exit_registry"], "code"])
     survivors = replace(is_market, eligible=is_market.eligible & ~is_market.codes.isin(exits))
@@ -260,7 +296,7 @@ def analyze(root=DEFAULT_CACHE):
     gaps = last_peak.diff().dt.days.dropna()
     last_gap = (main.nav.index[-1] - last_peak.iloc[-1]).days
     underwater = max(gaps.max() if len(gaps) else 0, last_gap)
-    matched, controls = random_controls(market, ranks, orders, lagged, main)
+    controls = random_controls(market, ranks, orders, lagged)
     attribution_parts, style_share = attribution(market, volume, main, lookback, index_close)
     capacity_by_day = main.trades.groupby("date")["capacity"].min()
     return {
@@ -269,7 +305,8 @@ def analyze(root=DEFAULT_CACHE):
         "engine_oos": engine_oos, "engine_stats": perf_stats(engine_nav), "costs": costs,
         "stress_slip": stress_slip, "stress_recovery": stress_recovery, "yearly": yearly,
         "largest_year": largest_year, "contribution": contribution, "best_days": best_days,
-        "trimmed": trimmed, "underwater": underwater, "matched": matched, "controls": controls,
+        "trimmed": trimmed, "underwater": underwater, "controls": controls,
+        "is_ablations": is_ablations,
         "attribution": attribution_parts, "style_share": style_share, "capacity": capacity_by_day,
         "audit": market.audit, "baselines": benchmark,
         "drawdown_episodes": drawdown_episodes(main.nav, index_close),

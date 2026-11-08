@@ -7,7 +7,7 @@ import pytest
 from qs.engine import run_backtest
 from qs.lowvol_momentum_data import Distribution, Market, _membership, execution_masks
 from qs.lowvol_momentum_execution import simulate
-from research.lowvol_momentum_study import HOLDINGS, WINDOWS, plateau, same_turnover
+from research.lowvol_momentum_study import HOLDINGS, WINDOWS, plateau, placebo_orders, single_factor_ranks
 from strategies import lowvol_momentum as strategy
 
 
@@ -174,12 +174,30 @@ def test_dividend_claim_is_marked_at_ex_date_without_anticipating_it():
     assert result.returns.iloc[3, 0] == pytest.approx(0.0)
 
 
-def test_plateau_rejects_isolated_winner_and_turnover_must_match():
+def test_plateau_rejects_isolated_winner():
     grid = pd.DataFrame(
         [(window, count, 0.13 if (window, count) == (126, 25) else 0.08, 0.07)
          for window in WINDOWS for count in HOLDINGS],
         columns=["lookback", "top_n", "cagr", "max_weight"],
     )
     assert plateau(grid) == ((126, 25), 1 / 25, False)
-    assert same_turnover(pd.Series([0.0, 0.20]), pd.Series([0.0, 0.20009]))
-    assert not same_turnover(pd.Series([0.0, 0.20]), pd.Series([0.0, 0.20011]))
+
+
+def test_placebo_matches_each_months_target_holdings_and_weights():
+    ranks = {0: np.array([1, 2, 3]), 20: np.array([2, 3]), 40: np.array([], dtype=int)}
+    orders = {0: {1: 0.04, 2: 0.04}, 20: {2: 0.04}, 40: {}}
+    randomized = placebo_orders(ranks, orders, np.random.default_rng(42))
+    for month, targets in orders.items():
+        assert len(randomized[month]) == len(targets)
+        assert sorted(randomized[month].values()) == sorted(targets.values())
+        assert randomized[month].keys() <= set(ranks[month])
+
+
+def test_ablations_drop_the_other_factors_filter():
+    market = market_fixture(260, 3)
+    day = market.dates.get_loc(market.month_ends[-2])
+    market.returns[:] = [-0.001, 0.001, 0.002]
+    market.returns[day - 2, 1] = np.nan
+    low_vol, momentum = single_factor_ranks(market, 126, strategy.average_volume(market))
+    assert 0 in low_vol[day] and 0 not in momentum[day]
+    assert 1 in momentum[day] and 1 not in low_vol[day]
