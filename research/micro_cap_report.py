@@ -67,7 +67,9 @@ def capacity_disclosure(market, ledger):
         code = suspended.code.value_counts().index[0]
         days = suspended.loc[suspended.code.eq(code), "date"]
         example = (f"例如，`{code}` 在 {days.min():%Y 年 %-m 月}至 {days.max():%Y 年 %-m 月}间"
-                   f"有 {len(days)} 个交易日触发零瓶颈。旧手工示例按停牌标记计数，包含标记为停牌但"
+                   f"有 {len(days)} 个持仓交易日，该股自身前一交易日可得的 20 日 ADV 窗口为零。"
+                   "多只持仓同时为零 ADV 时，持仓瓶颈栏每天只记录一只，因此逐股自身零 ADV 日数"
+                   "与瓶颈栏记录日数口径不同。旧手工示例按停牌标记计数，包含标记为停牌但"
                    "窗口内仍有成交额的日期。逐股示例按成交额更正，年度合计一致。")
 
     counts = yearly[["year", "hold_zero", "hold_empty", "order_zero"]]
